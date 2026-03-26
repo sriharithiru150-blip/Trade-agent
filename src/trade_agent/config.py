@@ -55,7 +55,7 @@ class Settings(BaseSettings):
 
     # ── Agent Behaviour ───────────────────────────────────────────────────────
     analysis_interval_minutes: Annotated[int, Field(ge=1)] = Field(
-        30, description="Minutes between analysis runs"
+        5, description="Minutes between analysis runs"
     )
     min_signal_score: Annotated[float, Field(ge=0.0, le=1.0)] = Field(
         0.65, description="Minimum combined score to open a trade"

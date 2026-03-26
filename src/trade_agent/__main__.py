@@ -33,34 +33,10 @@ def _handle_signal(signum: int, frame: object) -> None:
     _SHUTDOWN = True
 
 
-def _run_agent_cycle() -> None:
-    """Single analysis + execution cycle — called by the scheduler."""
-    from trade_agent.agent import TradingAgent  # lazy import for faster startup
-
-    settings = get_settings()
-    agent = TradingAgent(settings)
-
-    try:
-        summary = agent.run_once()
-        log.info("cycle_summary", text=summary)
-        print("\n" + "=" * 72)
-        print(summary)
-        print("=" * 72 + "\n")
-    except Exception as exc:
-        log.error("cycle_failed", error=str(exc), exc_info=True)
-
-    # End-of-day: close all positions 15 min before market close
-    now = now_ist()
-    close = market_close_ist()
-    minutes_to_close = (close - now).total_seconds() / 60
-    if 0 < minutes_to_close <= 15:
-        log.info("eod_squareoff_trigger", minutes_to_close=round(minutes_to_close, 1))
-        result = agent.square_off_all()
-        log.info("eod_result", **result)
-
-
 def main() -> None:
     """Main entry point — parse environment, configure logging, and start loop."""
+    from trade_agent.agent import TradingAgent  # lazy import for faster startup
+
     settings = get_settings()
     setup_logging(level=settings.log_level, log_file=settings.log_file)
 
@@ -83,25 +59,46 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    # Schedule the agent at the configured interval (during market hours only)
+    # Build the agent ONCE — reused across every cycle (avoids reconnect overhead)
+    agent = TradingAgent(settings)
+
+    def _run_cycle() -> None:
+        """Single analysis + execution cycle — called by the scheduler."""
+        try:
+            summary = agent.run_once()
+            log.info("cycle_summary", text=summary)
+            print("\n" + "=" * 72)
+            print(summary)
+            print("=" * 72 + "\n")
+        except Exception as exc:
+            log.error("cycle_failed", error=str(exc), exc_info=True)
+
+        # End-of-day: square off all positions 15 min before market close
+        now = now_ist()
+        close = market_close_ist()
+        minutes_to_close = (close - now).total_seconds() / 60
+        if 0 < minutes_to_close <= 15:
+            log.info("eod_squareoff_trigger", minutes_to_close=round(minutes_to_close, 1))
+            result = agent.square_off_all()
+            log.info("eod_result", **result)
+
     interval = settings.analysis_interval_minutes
-    schedule.every(interval).minutes.do(_run_agent_cycle)
+    schedule.every(interval).minutes.do(_run_cycle)
+    log.info("scheduler_set", interval_minutes=interval)
 
     # Run immediately on startup if market is open
     if is_market_open():
         log.info("market_open_running_immediately")
-        _run_agent_cycle()
+        _run_cycle()
     else:
         wait_secs = seconds_until_market_open()
-        log.info(
-            "waiting_for_market_open",
-            wait_minutes=round(wait_secs / 60, 1),
-        )
+        log.info("waiting_for_market_open", wait_minutes=round(wait_secs / 60, 1))
         print(f"Market is closed. Next open in {wait_secs / 60:.0f} minutes.")
 
+    # Poll every 5 seconds so scheduled jobs fire on time
     while not _SHUTDOWN:
         schedule.run_pending()
-        time.sleep(30)
+        time.sleep(5)
 
     log.info("trade_agent_stopped")
     sys.exit(0)
