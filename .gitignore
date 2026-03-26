@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type checking
+.mypy_cache/
+
+# Data files — never commit historical data or model outputs
+data/
+*.csv
+*.parquet
+*.feather
+*.pkl
+*.h5
+
+# Logs
+logs/
+*.log
+
+# Secrets — NEVER commit these
+*.pem
+*.key
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
