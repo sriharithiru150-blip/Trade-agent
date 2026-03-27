@@ -347,6 +347,7 @@ class TradingAgent:
             max_open_positions=settings.max_open_positions,
             max_trade_amount=settings.max_trade_amount,
             max_sector_positions=settings.max_sector_positions,
+            initial_capital=settings.initial_capital,
         )
 
         # Strategy

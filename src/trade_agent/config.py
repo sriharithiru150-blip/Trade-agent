@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     max_trade_amount: Annotated[float, Field(gt=0)] = Field(
         10_000.0, description="Max INR per single trade"
     )
+    initial_capital: Annotated[float, Field(ge=0)] = Field(
+        0.0,
+        description=(
+            "Your starting capital in INR. When set, the portfolio tracker shows "
+            "capital recovery progress and flags when you are trading on profits only. "
+            "Set to 0 to disable tracking."
+        ),
+    )
     max_open_positions: Annotated[int, Field(ge=1, le=50)] = Field(
         5, description="Max simultaneous open positions"
     )

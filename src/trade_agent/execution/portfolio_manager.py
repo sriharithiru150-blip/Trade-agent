@@ -94,9 +94,9 @@ class PortfolioManager:
         max_open_positions: Hard cap on simultaneous open positions.
         max_trade_amount: Max INR to deploy per trade (used for capacity checks).
         max_sector_positions: Max simultaneous positions in any single sector.
-            Prevents correlated blow-ups when multiple holdings are hit by the
-            same sector-wide event.  Symbols without a known sector are grouped
-            together under ``_UNKNOWN_SECTOR`` and subject to the same cap.
+        initial_capital: Starting capital in INR. Used to track capital recovery
+            — once cumulative realised P&L >= initial_capital, the initial
+            investment is considered recovered and trading continues on profits only.
     """
 
     def __init__(
@@ -104,10 +104,12 @@ class PortfolioManager:
         max_open_positions: int = 5,
         max_trade_amount: float = 10_000.0,
         max_sector_positions: int = 2,
+        initial_capital: float = 0.0,
     ) -> None:
         self._max_positions = max_open_positions
         self._max_trade_amount = max_trade_amount
         self._max_sector_positions = max_sector_positions
+        self._initial_capital = initial_capital
         self._positions: dict[str, Position] = {}
         self._closed_trades: list[ClosedTrade] = []
         self._realised_pnl: float = 0.0
@@ -139,6 +141,25 @@ class PortfolioManager:
 
     def has_position(self, symbol: str) -> bool:
         return symbol.upper() in self._positions
+
+    @property
+    def initial_capital_recovered(self) -> bool:
+        """True once cumulative realised P&L has covered the starting capital."""
+        if self._initial_capital <= 0:
+            return True  # no tracking configured
+        return self._realised_pnl >= self._initial_capital
+
+    @property
+    def capital_recovery_pct(self) -> float:
+        """Percentage of initial capital recovered through profits (0–100+)."""
+        if self._initial_capital <= 0:
+            return 100.0
+        return round(min(100.0, (self._realised_pnl / self._initial_capital) * 100), 2)
+
+    @property
+    def profit_only_mode(self) -> bool:
+        """True when initial capital is recovered — now trading on profits only."""
+        return self.initial_capital_recovered and self._initial_capital > 0
 
     def sector_position_count(self, sector: str) -> int:
         """Return number of open positions in ``sector``."""
@@ -306,11 +327,10 @@ class PortfolioManager:
 
     def summary(self) -> dict[str, object]:
         """Return a portfolio summary dict."""
-        # Aggregate sector exposure
         sector_counts: dict[str, int] = {}
         for sec in self._position_sectors.values():
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
-        return {
+        result: dict[str, object] = {
             "open_positions": self.position_count,
             "realised_pnl": round(self._realised_pnl, 2),
             "unrealised_pnl": round(self.unrealised_pnl, 2),
@@ -321,6 +341,16 @@ class PortfolioManager:
             "winning_trades": sum(1 for t in self._closed_trades if t.pnl > 0),
             "losing_trades": sum(1 for t in self._closed_trades if t.pnl < 0),
         }
+        if self._initial_capital > 0:
+            result["initial_capital"] = round(self._initial_capital, 2)
+            result["capital_recovery_pct"] = self.capital_recovery_pct
+            result["initial_capital_recovered"] = self.initial_capital_recovered
+            result["profit_only_mode"] = self.profit_only_mode
+            if not self.initial_capital_recovered:
+                result["remaining_to_recover"] = round(
+                    self._initial_capital - self._realised_pnl, 2
+                )
+        return result
 
     def trade_history(self) -> list[dict[str, object]]:
         """Return all closed trades as a list of dicts."""
