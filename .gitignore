@@ -31,7 +31,8 @@ htmlcov/
 .mypy_cache/
 
 # Data files — never commit historical data or model outputs
-data/
+# Use /data/ to only match top-level, not src/trade_agent/data/
+/data/
 *.csv
 *.parquet
 *.feather
