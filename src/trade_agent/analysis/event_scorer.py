@@ -1,26 +1,18 @@
 """Event scorer — combines corporate events, institutional flows, and options
 positioning into a single conviction score for Claude to reason over.
 
-The score is deliberately NOT a trading signal on its own.  It is structured
-evidence that Claude uses to form a thesis, check against technicals, and then
-decide.  The goal is to surface the *right questions*, not automate the answer.
-
-Scoring model
--------------
-Each input dimension produces a sub-score in [-1, 1]:
-  event_score     — what the corporate events imply
-  flow_score      — what institutional bulk/block deals imply
-  options_score   — what options positioning implies (0.5 neutral)
-  age_penalty     — freshness weight (older events carry less conviction)
-
-The final conviction score maps to [0, 1]:
-  0.0–0.35  strong bearish evidence
-  0.35–0.55 ambiguous / insufficient data
-  0.55–0.75 moderate bullish evidence
-  0.75–1.0  strong bullish evidence
-
-Claude is told the sub-scores AND the evidence so it can override or discount
-based on its broader understanding of the company / market context.
+Changes vs previous version
+----------------------------
+- flow_score now normalises against the stock's ADV (passed in), not just
+  total traded value of the deals. A ₹2 Cr deal on ₹8 Cr ADV stock is
+  significant; the same ₹2 Cr on ₹400 Cr ADV is noise. An absolute INR
+  floor (₹1 Cr) filters deals too small to be informative regardless of ADV.
+- event_score uses direction_score (float, contextual) instead of flat int.
+  QIPs, credit rating changes, and management changes are now scored based
+  on headline context rather than a fixed ±1.
+- options_score is downweighted when the snapshot is stale (>5 min from
+  NSE's public refresh cycle). Claude is explicitly told this in the summary.
+- Conviction formula weights adjusted for the above.
 """
 
 from __future__ import annotations
@@ -35,6 +27,17 @@ from trade_agent.utils.logger import get_logger
 log = get_logger(__name__)
 
 Bias = Literal["bullish", "bearish", "neutral", "mixed"]
+
+# Minimum bulk/block deal size to be scored (absolute floor)
+_MIN_DEAL_CR = 1.0          # ignore deals < ₹1 Cr — too small to be informative
+
+# Minimum deal size as fraction of ADV to be considered meaningful
+_MIN_DEAL_ADV_FRACTION = 0.005   # 0.5% of ADV
+
+# Weights — must sum to 1.0
+_W_EVENT   = 0.45
+_W_FLOW    = 0.35
+_W_OPTIONS = 0.20
 
 
 @dataclass
@@ -90,6 +93,7 @@ class EventScorer:
         events: list[CorporateEvent],
         deals: list[BulkDeal],
         options: OptionsChainSnapshot | None,
+        adv_cr: float | None = None,
     ) -> EventEvidence:
         """Compute structured evidence for ``symbol``.
 
@@ -97,21 +101,27 @@ class EventScorer:
             symbol: NSE stock symbol.
             events: Recent corporate announcements from :class:`EventScraper`.
             deals: Today's bulk/block deals from :class:`EventScraper`.
-            options: Options chain snapshot from :class:`OptionsChainClient`.
+            options: Options chain snapshot (may be stale — staleness is flagged).
+            adv_cr: 20-day average daily traded value in crores. Used to
+                normalise deal sizes. If None, falls back to relative sizing.
 
         Returns:
             :class:`EventEvidence` with all sub-scores and summaries.
         """
         event_score, event_summary, event_risks = self._score_events(events)
-        flow_score, flow_summary, flow_risks = self._score_flows(deals)
-        opt_score, opt_summary, opt_risks = self._score_options(options)
+        flow_score, flow_summary, flow_risks = self._score_flows(deals, adv_cr)
+        opt_score, opt_summary, opt_risks, opt_weight = self._score_options(options)
 
-        # Weighted combination (events carry most weight since they're exchange-filed)
-        # Weights: events 45%, flow 35%, options 20%
-        raw = (0.45 * event_score + 0.35 * flow_score + 0.20 * (opt_score * 2 - 1))
-        # raw is in [-1, 1]; map to [0, 1]
+        # Adjust weights if options data is stale — redistribute to events/flow
+        if opt_weight < _W_OPTIONS:
+            deficit = _W_OPTIONS - opt_weight
+            w_evt = _W_EVENT + deficit * 0.6
+            w_flw = _W_FLOW + deficit * 0.4
+        else:
+            w_evt, w_flw = _W_EVENT, _W_FLOW
+
+        raw = w_evt * event_score + w_flw * flow_score + opt_weight * (opt_score * 2 - 1)
         conviction = round(min(1.0, max(0.0, (raw + 1.0) / 2.0)), 4)
-
         bias = _bias(conviction)
         all_risks = event_risks + flow_risks + opt_risks
 
@@ -122,6 +132,7 @@ class EventScorer:
             bias=bias,
             events=len(events),
             deals=len(deals),
+            opt_weight=round(opt_weight, 2),
         )
 
         return EventEvidence(
@@ -143,10 +154,13 @@ class EventScorer:
     # ── Sub-scorers ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _score_events(
-        events: list[CorporateEvent],
-    ) -> tuple[float, str, list[str]]:
-        """Score corporate events. Returns (score, summary, risks)."""
+    def _score_events(events: list[CorporateEvent]) -> tuple[float, str, list[str]]:
+        """Score corporate events using contextual direction_score.
+
+        Uses event.direction_score (float, headline-aware) instead of the old
+        flat integer EVENT_DIRECTION map.  Freshness is now tiered by market
+        cap via event.freshness_window.
+        """
         if not events:
             return 0.0, "No recent corporate announcements.", []
 
@@ -156,103 +170,152 @@ class EventScorer:
         risks: list[str] = []
 
         for evt in events:
-            # Freshness weight: events older than 60 min carry half weight
-            freshness = max(0.1, 1.0 - (evt.age_minutes / 120))
-            weight = evt.urgency * freshness
-            direction = float(evt.direction)
+            # Freshness: linear decay within the tier's window, zero beyond it
+            if evt.age_minutes > evt.freshness_window:
+                continue   # outside the edge window for this market cap tier
+            freshness = 1.0 - (evt.age_minutes / evt.freshness_window)
+            weight = evt.urgency * max(freshness, 0.05)
+            direction = evt.direction_score   # now a float, contextual
 
             weighted_dir += direction * weight
             total_weight += weight
 
             highlights.append(
-                f"[{evt.event_type.value.upper()}] {evt.headline} "
-                f"(filed {evt.age_minutes:.0f}m ago)"
+                f"[{evt.event_type.value.upper()}] {evt.headline[:80]} "
+                f"(filed {evt.age_minutes:.0f}m ago, "
+                f"window={evt.freshness_window}m, dir={direction:+.1f})"
             )
 
-            # Risk flags
             if evt.event_type in (EventType.DEBT_DEFAULT, EventType.SEBI_ORDER):
                 risks.append(f"HIGH RISK: {evt.event_type.value} — {evt.headline[:80]}")
-            if evt.event_type == EventType.QIP:
-                risks.append("Dilution risk from QIP/rights issue")
+            if evt.event_type == EventType.QIP and direction < 0:
+                risks.append("Distress-signal QIP — possible dilution under duress")
             if evt.event_type == EventType.PROMOTER_PLEDGE:
-                risks.append("Promoter pledging — potential forced selling")
+                risks.append("Promoter pledging — potential forced selling pressure")
 
-        score = (weighted_dir / total_weight) if total_weight > 0 else 0.0
-        summary = "; ".join(highlights[:5])
-        return float(min(1.0, max(-1.0, score))), summary, risks
+        if total_weight == 0:
+            return 0.0, "All events outside freshness window for this stock's market cap tier.", []
+
+        score = float(min(1.0, max(-1.0, weighted_dir / total_weight)))
+        summary = " | ".join(highlights[:5])
+        return score, summary, risks
 
     @staticmethod
     def _score_flows(
         deals: list[BulkDeal],
+        adv_cr: float | None,
     ) -> tuple[float, str, list[str]]:
-        """Score institutional bulk/block deal flows. Returns (score, summary, risks)."""
+        """Score institutional bulk/block deal flows.
+
+        Normalises institutional net flow against ADV (if provided) so that
+        the same absolute deal INR carries more weight on a low-ADV stock than
+        on a high-ADV stock.  Deals below ₹1 Cr absolute or below 0.5% of ADV
+        are filtered as noise.
+        """
         if not deals:
             return 0.0, "No bulk/block deals today.", []
 
-        buy_cr = 0.0
-        sell_cr = 0.0
         inst_buy_cr = 0.0
         inst_sell_cr = 0.0
+        retail_buy_cr = 0.0
+        retail_sell_cr = 0.0
         highlights: list[str] = []
         risks: list[str] = []
+        skipped = 0
 
         for deal in deals:
             val = deal.value_cr
+
+            # Absolute floor
+            if val < _MIN_DEAL_CR:
+                skipped += 1
+                continue
+
+            # ADV-relative floor (if ADV known)
+            if adv_cr is not None and adv_cr > 0:
+                if val / adv_cr < _MIN_DEAL_ADV_FRACTION:
+                    skipped += 1
+                    continue
+
             if deal.transaction == "BUY":
-                buy_cr += val
                 if deal.is_institutional:
                     inst_buy_cr += val
+                else:
+                    retail_buy_cr += val
             else:
-                sell_cr += val
                 if deal.is_institutional:
                     inst_sell_cr += val
+                else:
+                    retail_sell_cr += val
 
+            tag = f"[{deal.institution_type}]" if deal.is_institutional else "[RETAIL]"
             highlights.append(
-                f"{deal.client_name[:30]} {deal.transaction} "
-                f"₹{val:.1f}Cr @ ₹{deal.price:.1f}"
-                + (f" [{deal.institution_type}]" if deal.is_institutional else "")
+                f"{deal.client_name[:28]} {deal.transaction} ₹{val:.1f}Cr {tag}"
             )
 
-        # Institutional net flow as a fraction of total traded value
-        total = buy_cr + sell_cr or 1.0
         net_inst = inst_buy_cr - inst_sell_cr
-        score = net_inst / max(total, 1.0)
+        total_inst = inst_buy_cr + inst_sell_cr or 1.0
 
-        if inst_sell_cr > inst_buy_cr * 2:
+        # Normalise: if ADV known, express as multiple of ADV; else use fraction of inst total
+        if adv_cr is not None and adv_cr > 0:
+            # Score based on net flow as % of ADV — 5% of ADV = full score
+            score = float(min(1.0, max(-1.0, (net_inst / adv_cr) / 0.05)))
+        else:
+            score = float(min(1.0, max(-1.0, net_inst / total_inst)))
+
+        if inst_sell_cr > inst_buy_cr * 2 and inst_sell_cr > 5.0:
             risks.append(
                 f"Heavy institutional selling: ₹{inst_sell_cr:.1f}Cr vs "
                 f"₹{inst_buy_cr:.1f}Cr buying"
             )
 
+        adv_context = f" (ADV ₹{adv_cr:.0f}Cr)" if adv_cr else ""
         summary = (
-            f"Total bulk/block flows — Buy: ₹{buy_cr:.1f}Cr, Sell: ₹{sell_cr:.1f}Cr. "
-            f"Institutional net: ₹{net_inst:+.1f}Cr. "
-            + "; ".join(highlights[:3])
+            f"Inst net{adv_context}: ₹{net_inst:+.1f}Cr "
+            f"(buy ₹{inst_buy_cr:.1f}Cr / sell ₹{inst_sell_cr:.1f}Cr). "
+            + "; ".join(highlights[:4])
+            + (f" [{skipped} deals below floor filtered]" if skipped else "")
         )
-        return float(min(1.0, max(-1.0, score * 3))), summary, risks
+        return score, summary, risks
 
     @staticmethod
     def _score_options(
         options: OptionsChainSnapshot | None,
-    ) -> tuple[float, str, list[str]]:
-        """Score options positioning. Returns (0–1 score, summary, risks)."""
+    ) -> tuple[float, str, list[str], float]:
+        """Score options positioning. Returns (0–1 score, summary, risks, weight).
+
+        If the snapshot is stale (>5 min), the effective weight returned to
+        the caller is reduced so Claude and the conviction formula are both
+        informed of the reduced confidence.
+        """
         if options is None:
-            return 0.5, "No options data available.", []
+            return 0.5, "No options data available.", [], 0.0
 
         risks: list[str] = []
-        d = options.to_dict()
+        age = options.data_age_minutes
 
+        # Staleness: linearly reduce weight from full at 0 min to 0 at 10 min
+        staleness_factor = max(0.0, 1.0 - (age / 10.0))
+        effective_weight = round(_W_OPTIONS * staleness_factor, 4)
+
+        if options.is_stale:
+            risks.append(
+                f"Options data is {age:.1f} min old (NSE public feed refreshes every "
+                f"3-5 min). On event days this covers the full tradeable window — "
+                f"options weight reduced to {effective_weight:.2f} (from {_W_OPTIONS})."
+            )
         if options.pcr_oi > 1.5:
             risks.append(f"Extreme PCR ({options.pcr_oi:.2f}) — potential mean reversion")
         if options.pcr_oi < 0.5:
             risks.append(f"Very low PCR ({options.pcr_oi:.2f}) — crowded longs, reversal risk")
         if options.iv_skew > 5:
-            risks.append("Elevated put IV skew — market hedging downside")
+            risks.append("Elevated put IV skew — market paying for downside protection")
 
         price = options.underlying_price
         pain_gap = ((options.max_pain - price) / price * 100) if price else 0
+        stale_tag = f" ⚠ DATA {age:.0f}m OLD" if options.is_stale else ""
         summary = (
-            f"PCR(OI)={options.pcr_oi:.2f} ({options.sentiment}), "
+            f"PCR(OI)={options.pcr_oi:.2f} ({options.sentiment}){stale_tag}, "
             f"MaxPain=₹{options.max_pain:.0f} ({pain_gap:+.1f}% from CMP), "
             f"Call wall=₹{options.call_oi_wall:.0f}, "
             f"Put wall=₹{options.put_oi_wall:.0f}, "
@@ -263,7 +326,7 @@ class EventScorer:
         if options.unusual_put_strikes:
             summary += f". Unusual put OI at {options.unusual_put_strikes[:2]}"
 
-        return options.signal_score, summary, risks
+        return options.signal_score, summary, risks, effective_weight
 
 
 def _bias(conviction: float) -> Bias:

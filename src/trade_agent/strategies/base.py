@@ -13,6 +13,9 @@ from trade_agent.data.news_fetcher import Article
 
 TradeDirection = Literal["LONG", "SKIP"]
 
+# Default R:R ratio used when widening take-profit to meet minimum
+_DEFAULT_RR_RATIO = 2.5
+
 
 @dataclass
 class StrategyResult:
@@ -92,6 +95,56 @@ class BaseStrategy(ABC):
         stop_loss = round(entry_price * (1.0 - self.stop_loss_pct), 2)
         take_profit = round(entry_price * (1.0 + self.take_profit_pct), 2)
         return stop_loss, take_profit
+
+    def _calc_atr_levels(
+        self,
+        history: pd.DataFrame,
+        entry_price: float,
+        atr_multiplier: float = 1.5,
+        rr_ratio: float = _DEFAULT_RR_RATIO,
+    ) -> tuple[float, float, float]:
+        """Return (stop_loss, take_profit, atr14) using ATR-based sizing.
+
+        Computes ATR-14 from the history DataFrame and places the stop-loss
+        at ``entry_price - atr_multiplier * ATR14``.  Take-profit uses
+        ``rr_ratio`` times the risk distance.  Falls back to
+        ``_calc_levels()`` if history is too short or ATR is zero.
+
+        Args:
+            history: Daily OHLCV DataFrame with at least 15 rows.
+            entry_price: Intended entry price.
+            atr_multiplier: How many ATR units below entry to place the stop.
+            rr_ratio: Risk-to-reward ratio for take-profit placement.
+
+        Returns:
+            (stop_loss, take_profit, atr14) — atr14 is 0.0 on fallback.
+        """
+        if len(history) < 15 or entry_price <= 0:
+            sl, tp = self._calc_levels(entry_price)
+            return sl, tp, 0.0
+
+        high = history["High"]
+        low = history["Low"]
+        prev_close = history["Close"].shift(1)
+
+        tr = pd.concat(
+            [
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        atr14 = float(tr.rolling(14).mean().iloc[-1])
+
+        if atr14 <= 0:
+            sl, tp = self._calc_levels(entry_price)
+            return sl, tp, 0.0
+
+        stop_loss = round(entry_price - atr_multiplier * atr14, 2)
+        take_profit = round(entry_price + atr_multiplier * atr14 * rr_ratio, 2)
+        return stop_loss, take_profit, atr14
 
     def _calc_quantity(self, entry_price: float) -> int:
         """Return share quantity that fits within max_trade_amount."""

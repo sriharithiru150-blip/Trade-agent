@@ -44,9 +44,13 @@ _MIN_CONVICTION = 0.60
 # Minimum urgency of at least one event in the bundle
 _MIN_URGENCY = 0.55
 
-# For swing trades, widen the risk:reward parameters
-_SWING_STOP_LOSS_PCT = 0.03     # 3% stop (absorbs more noise than intraday)
-_SWING_TAKE_PROFIT_PCT = 0.09   # 9% target (3:1 R:R minimum)
+# ATR-based stop placement parameters
+_ATR_STOP_MULTIPLIER = 1.5      # stop placed 1.5×ATR below entry
+_ATR_RR_RATIO = 2.5             # take-profit at 2.5× the risk distance (ATR)
+
+# Percentage-based fallback if ATR cannot be computed (< 15 rows of history)
+_SWING_STOP_LOSS_PCT = 0.03     # 3% stop fallback
+_SWING_TAKE_PROFIT_PCT = 0.09   # 9% target fallback (3:1 R:R minimum)
 
 # Events that on their own are sufficient to trigger analysis
 _STANDALONE_TRIGGER_EVENTS = {
@@ -108,7 +112,9 @@ class EventDrivenStrategy(BaseStrategy):
             StrategyResult with LONG or SKIP.
         """
         entry_price = float(history["Close"].iloc[-1])
-        sl_raw, tp = self._calc_levels(entry_price)
+        sl_raw, tp, atr14 = self._calc_atr_levels(
+            history, entry_price, _ATR_STOP_MULTIPLIER, _ATR_RR_RATIO
+        )
 
         # ── Gate 1: liquidity ─────────────────────────────────────────────────
         if liquidity is not None and not liquidity.is_liquid:
@@ -194,10 +200,12 @@ class EventDrivenStrategy(BaseStrategy):
 
         # Build rationale
         top_event = actionable[0]
+        stop_method = f"ATR14={atr14:.2f}" if atr14 > 0 else "pct-fallback"
         rationale_parts = [
             f"EventDriven: conviction={evidence.conviction:.2f} ({evidence.bias})",
             f"Trigger: [{top_event.event_type.value.upper()}] {top_event.headline[:80]}",
             f"Filed {top_event.age_minutes:.0f}m ago",
+            f"Stop: {stop_method} ({_ATR_STOP_MULTIPLIER}×ATR)",
             evidence.flow_summary[:120] if evidence.flow_summary else "",
             evidence.options_summary[:100] if evidence.options_summary else "",
         ]
@@ -220,6 +228,7 @@ class EventDrivenStrategy(BaseStrategy):
             sl=sl_adjusted,
             tp=tp,
             qty=qty_raw,
+            atr14=round(atr14, 2),
         )
 
         return StrategyResult(

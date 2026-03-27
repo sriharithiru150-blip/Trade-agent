@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
+
 import pytest
 
 from trade_agent.data.options_chain import (
@@ -103,6 +105,28 @@ class TestOptionsChainSnapshot:
         assert "max_pain" in d
         assert "sentiment" in d
         assert "signal_score" in d
+        assert "data_age_minutes" in d
+        assert "is_stale" in d
+
+    def test_fresh_snapshot_not_stale(self) -> None:
+        snap = self._make_snapshot(pcr=1.0)
+        # fetched_at defaults to now
+        assert snap.is_stale is False
+        assert snap.data_age_minutes < 1.0
+
+    def test_old_snapshot_is_stale(self) -> None:
+        snap = self._make_snapshot(pcr=1.0)
+        # Backdate the fetch time by 10 minutes
+        snap.fetched_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        assert snap.is_stale is True
+        assert snap.data_age_minutes >= 9.9
+
+    def test_stale_dict_includes_staleness_note(self) -> None:
+        snap = self._make_snapshot(pcr=1.0)
+        snap.fetched_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        d = snap.to_dict()
+        assert d["is_stale"] is True
+        assert d["staleness_note"] is not None
 
 
 class TestComputeMaxPain:

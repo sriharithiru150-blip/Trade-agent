@@ -28,7 +28,11 @@ def _make_order(symbol: str) -> Order:
 
 class TestPortfolioManager:
     def setup_method(self) -> None:
-        self.pm = PortfolioManager(max_open_positions=3, max_trade_amount=10_000.0)
+        self.pm = PortfolioManager(
+            max_open_positions=3,
+            max_trade_amount=10_000.0,
+            max_sector_positions=2,
+        )
 
     def test_initially_empty(self) -> None:
         assert self.pm.position_count == 0
@@ -95,3 +99,47 @@ class TestPortfolioManager:
         assert "realised_pnl" in summary
         assert "total_pnl" in summary
         assert "positions" in summary
+        assert "sector_exposure" in summary
+
+    def test_sector_cap_blocks_third_position_in_same_sector(self) -> None:
+        pm = PortfolioManager(max_open_positions=5, max_sector_positions=2)
+        for sym in ("RELIANCE", "TCS"):
+            pm.open_position(sym, 1, 100.0, 95.0, 110.0, _make_order(sym), None, sector="IT")
+        # Third IT position should be blocked
+        assert pm.can_open("INFY", sector="IT") is False
+
+    def test_sector_cap_allows_different_sector(self) -> None:
+        pm = PortfolioManager(max_open_positions=5, max_sector_positions=2)
+        for sym in ("RELIANCE", "TCS"):
+            pm.open_position(sym, 1, 100.0, 95.0, 110.0, _make_order(sym), None, sector="IT")
+        # Different sector should still be allowed
+        assert pm.can_open("HDFCBANK", sector="Banking") is True
+
+    def test_sector_cap_released_on_close(self) -> None:
+        pm = PortfolioManager(max_open_positions=5, max_sector_positions=2)
+        for sym in ("RELIANCE", "TCS"):
+            pm.open_position(sym, 1, 100.0, 95.0, 110.0, _make_order(sym), None, sector="IT")
+        pm.close_position("TCS", 105.0, "take_profit")
+        # After closing one IT position, another should be allowed
+        assert pm.can_open("INFY", sector="IT") is True
+
+    def test_sector_cap_skipped_when_no_sector_passed(self) -> None:
+        pm = PortfolioManager(max_open_positions=5, max_sector_positions=1)
+        pm.open_position("RELIANCE", 1, 100.0, 95.0, 110.0, _make_order("RELIANCE"), None, sector="IT")
+        # When sector=None, skip the sector check
+        assert pm.can_open("TCS", sector=None) is True
+
+    def test_sector_count_tracked_correctly(self) -> None:
+        pm = PortfolioManager(max_open_positions=5, max_sector_positions=3)
+        pm.open_position("RELIANCE", 1, 100.0, 95.0, 110.0, _make_order("RELIANCE"), None, sector="Energy")
+        pm.open_position("TCS", 1, 200.0, 190.0, 220.0, _make_order("TCS"), None, sector="IT")
+        assert pm.sector_position_count("Energy") == 1
+        assert pm.sector_position_count("IT") == 1
+        assert pm.sector_position_count("Banking") == 0
+
+    def test_summary_includes_sector_exposure(self) -> None:
+        pm = PortfolioManager(max_open_positions=5, max_sector_positions=3)
+        pm.open_position("RELIANCE", 1, 100.0, 95.0, 110.0, _make_order("RELIANCE"), None, sector="Energy")
+        pm.open_position("TCS", 1, 200.0, 190.0, 220.0, _make_order("TCS"), None, sector="IT")
+        summary = pm.summary()
+        assert summary["sector_exposure"] == {"Energy": 1, "IT": 1}

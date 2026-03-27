@@ -13,12 +13,12 @@ from trade_agent.data.options_chain import OptionsChainSnapshot, StrikeData
 
 def _event(
     event_type: EventType = EventType.BUYBACK,
-    age_minutes: float = 20.0,
-    direction: int = 1,
+    age_minutes: float = 5.0,   # default within 15-min Nifty50 window
+    symbol: str = "RELIANCE",
 ) -> CorporateEvent:
     filed = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
     return CorporateEvent(
-        symbol="RELIANCE",
+        symbol=symbol,
         exchange="NSE",
         event_type=event_type,
         headline=f"{event_type.value} announcement",
@@ -75,7 +75,7 @@ class TestEventScorer:
     def test_bullish_inputs_give_high_conviction(self) -> None:
         ev = self.scorer.score(
             "RELIANCE",
-            [_event(EventType.BUYBACK, age_minutes=15)],
+            [_event(EventType.BUYBACK, age_minutes=5)],  # well within 15-min window
             [_deal("BUY", 30.0)],
             _options_snap(pcr=1.3),
         )
@@ -85,7 +85,7 @@ class TestEventScorer:
     def test_bearish_events_give_low_conviction(self) -> None:
         ev = self.scorer.score(
             "RELIANCE",
-            [_event(EventType.DEBT_DEFAULT, age_minutes=10)],
+            [_event(EventType.DEBT_DEFAULT, age_minutes=5)],
             [_deal("SELL", 40.0)],
             _options_snap(pcr=0.5),
         )
@@ -99,11 +99,49 @@ class TestEventScorer:
     def test_risks_populated_for_default(self) -> None:
         ev = self.scorer.score(
             "RELIANCE",
-            [_event(EventType.DEBT_DEFAULT)],
+            [_event(EventType.DEBT_DEFAULT, age_minutes=5)],
             [],
             None,
         )
         assert len(ev.key_risks) > 0
+
+    def test_adv_normalised_flow_score_high_deal(self) -> None:
+        # ₹30Cr deal on ₹100Cr ADV → 30% of ADV → capped at 1.0
+        ev = self.scorer.score(
+            "RELIANCE",
+            [],
+            [_deal("BUY", 30.0)],
+            None,
+            adv_cr=100.0,
+        )
+        assert ev.flow_score == pytest.approx(1.0)
+
+    def test_adv_normalised_flow_score_small_deal_on_large_adv(self) -> None:
+        # ₹2Cr deal on ₹400Cr ADV → 0.5% of ADV → exactly at ADV floor, score near zero
+        ev = self.scorer.score(
+            "RELIANCE",
+            [],
+            [_deal("BUY", 2.0)],
+            None,
+            adv_cr=400.0,
+        )
+        # 0.5% of ADV = minimum threshold; deal is filtered (below 0.5% * 400 = 2.0 Cr minimum)
+        # Actually 2.0/400 = 0.005 = _MIN_DEAL_ADV_FRACTION exactly, so NOT filtered
+        # score = (2.0/400)/0.05 = 0.005/0.05 = 0.1
+        assert 0.0 < ev.flow_score < 0.5
+
+    def test_small_deal_below_floor_filtered(self) -> None:
+        # ₹0.5Cr deal — below the ₹1Cr absolute floor
+        tiny_deal = _deal("BUY", 0.5)
+        ev = self.scorer.score("RELIANCE", [], [tiny_deal], None)
+        # Filtered out → neutral flow
+        assert ev.flow_score == pytest.approx(0.0)
+
+    def test_stale_events_outside_window_ignored(self) -> None:
+        # RELIANCE is Nifty50, window = 15 min; age 20 min → outside window
+        stale_evt = _event(EventType.BUYBACK, age_minutes=20.0)
+        ev = self.scorer.score("RELIANCE", [stale_evt], [], None)
+        assert ev.event_score == pytest.approx(0.0)
 
     def test_to_dict_serialisable(self) -> None:
         ev = self.scorer.score("INFY", [_event()], [], None)

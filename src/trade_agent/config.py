@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     max_open_positions: Annotated[int, Field(ge=1, le=50)] = Field(
         5, description="Max simultaneous open positions"
     )
+    max_sector_positions: Annotated[int, Field(ge=1, le=20)] = Field(
+        2, description="Max simultaneous positions in any single sector"
+    )
     stop_loss_pct: Annotated[float, Field(gt=0, lt=1)] = Field(
         0.02, description="Stop-loss as fraction of entry price"
     )

@@ -11,9 +11,13 @@ from trade_agent.data.events import (
     CorporateEvent,
     EventScraper,
     EventType,
+    MarketCapTier,
     _classify_event,
     _classify_institution,
     _event_id,
+    get_freshness_window,
+    get_market_cap_tier,
+    score_event_direction,
 )
 
 
@@ -94,10 +98,6 @@ class TestCorporateEvent:
         evt = self._make_event(age_minutes=45.0)
         assert 44 <= evt.age_minutes <= 46
 
-    def test_direction_buyback_is_bullish(self) -> None:
-        evt = self._make_event()
-        assert evt.direction == 1
-
     def test_urgency_buyback(self) -> None:
         evt = self._make_event()
         assert evt.urgency >= 0.8
@@ -107,8 +107,31 @@ class TestCorporateEvent:
         d = evt.to_dict()
         assert "event_type" in d
         assert "filing_time" in d
-        assert "direction" in d
+        assert "direction_score" in d
         assert "urgency" in d
+        assert "freshness_window_minutes" in d
+        assert "is_fresh" in d
+
+    def test_freshness_window_reliance_is_15(self) -> None:
+        # RELIANCE is Nifty50 → 15-minute window
+        evt = self._make_event(age_minutes=10.0)
+        assert evt.freshness_window == 15
+
+    def test_is_fresh_within_window(self) -> None:
+        evt = self._make_event(age_minutes=10.0)
+        assert evt.is_fresh is True
+
+    def test_is_stale_outside_window(self) -> None:
+        evt = self._make_event(age_minutes=20.0)  # > 15 min window for Nifty50
+        assert evt.is_fresh is False
+
+    def test_direction_score_buyback_is_positive(self) -> None:
+        evt = self._make_event()
+        assert evt.direction_score == pytest.approx(1.0)
+
+    def test_direction_backward_compat(self) -> None:
+        evt = self._make_event()
+        assert evt.direction == 1
 
 
 class TestBulkDeal:
@@ -146,3 +169,76 @@ class TestEventId:
         id1 = _event_id("RELIANCE", "Buyback approved", "01-Jan-2025")
         id2 = _event_id("TCS", "Buyback approved", "01-Jan-2025")
         assert id1 != id2
+
+
+class TestMarketCapTier:
+    def test_nifty50_symbol_is_large(self) -> None:
+        assert get_market_cap_tier("RELIANCE") == MarketCapTier.LARGE
+        assert get_market_cap_tier("TCS") == MarketCapTier.LARGE
+
+    def test_nifty_next50_symbol_is_mid(self) -> None:
+        assert get_market_cap_tier("ZOMATO") == MarketCapTier.MID
+
+    def test_midcap_symbol_is_mid(self) -> None:
+        assert get_market_cap_tier("IRCTC") == MarketCapTier.MID
+
+    def test_unknown_symbol_is_small(self) -> None:
+        assert get_market_cap_tier("UNKNOWNSYM") == MarketCapTier.SMALL
+
+    def test_freshness_window_large_is_15(self) -> None:
+        assert get_freshness_window("RELIANCE") == 15
+
+    def test_freshness_window_mid_is_45(self) -> None:
+        assert get_freshness_window("ZOMATO") == 45
+
+    def test_freshness_window_small_is_90(self) -> None:
+        assert get_freshness_window("UNKNOWNSYM") == 90
+
+    def test_lowercase_input_handled(self) -> None:
+        assert get_market_cap_tier("reliance") == MarketCapTier.LARGE
+
+
+class TestScoreEventDirection:
+    def test_buyback_is_bullish(self) -> None:
+        score = score_event_direction(EventType.BUYBACK, "Company announces buyback")
+        assert score == pytest.approx(1.0)
+
+    def test_debt_default_is_bearish(self) -> None:
+        score = score_event_direction(EventType.DEBT_DEFAULT, "Company defaults on NCD payment")
+        assert score == pytest.approx(-1.0)
+
+    def test_qip_capex_is_mildly_positive(self) -> None:
+        score = score_event_direction(EventType.QIP, "QIP for capex and expansion")
+        assert score == pytest.approx(0.3)
+
+    def test_qip_distress_is_negative(self) -> None:
+        score = score_event_direction(EventType.QIP, "QIP to repay debt and NPA resolution")
+        assert score == pytest.approx(-0.8)
+
+    def test_qip_default_is_mildly_negative(self) -> None:
+        score = score_event_direction(EventType.QIP, "QIP allotment completed")
+        assert score == pytest.approx(-0.3)
+
+    def test_credit_rating_upgrade_is_positive(self) -> None:
+        score = score_event_direction(EventType.CREDIT_RATING, "CRISIL upgrade to AA+")
+        assert score == pytest.approx(0.8)
+
+    def test_credit_rating_downgrade_is_negative(self) -> None:
+        score = score_event_direction(EventType.CREDIT_RATING, "Moody's downgrade to B3")
+        assert score == pytest.approx(-0.9)
+
+    def test_management_resign_is_negative(self) -> None:
+        score = score_event_direction(EventType.MANAGEMENT_CHANGE, "CFO resigns with immediate effect")
+        assert score == pytest.approx(-0.5)
+
+    def test_management_appoint_is_mildly_positive(self) -> None:
+        score = score_event_direction(EventType.MANAGEMENT_CHANGE, "New CEO appointed from industry")
+        assert score == pytest.approx(0.2)
+
+    def test_ma_target_is_positive(self) -> None:
+        score = score_event_direction(EventType.MERGER_ACQUISITION, "Company acquired via takeover bid")
+        assert score == pytest.approx(0.8)
+
+    def test_ma_acquirer_is_slightly_negative(self) -> None:
+        score = score_event_direction(EventType.MERGER_ACQUISITION, "Company acquires rival for ₹500Cr")
+        assert score == pytest.approx(-0.2)

@@ -25,6 +25,7 @@ IV Skew
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -90,6 +91,8 @@ class OptionsChainSnapshot:
     iv_skew: float = 0.0          # avg put IV − avg call IV (positive = put skew)
     unusual_call_strikes: list[float] = field(default_factory=list)
     unusual_put_strikes: list[float] = field(default_factory=list)
+    # Data freshness — NSE public API refreshes every 3-5 min, not real-time
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def sentiment(self) -> str:
@@ -109,7 +112,18 @@ class OptionsChainSnapshot:
         skew_adj = -0.05 * min(1.0, max(-1.0, self.iv_skew / 10.0))
         return round(min(1.0, max(0.0, base + skew_adj)), 4)
 
+    @property
+    def data_age_minutes(self) -> float:
+        """Minutes since this snapshot was fetched from NSE."""
+        return (datetime.now(timezone.utc) - self.fetched_at).total_seconds() / 60
+
+    @property
+    def is_stale(self) -> bool:
+        """NSE public API refreshes every 3-5 min; flag if older than 5 min."""
+        return self.data_age_minutes > 5.0
+
     def to_dict(self) -> dict[str, object]:
+        age = round(self.data_age_minutes, 1)
         return {
             "symbol": self.symbol,
             "underlying_price": self.underlying_price,
@@ -123,6 +137,13 @@ class OptionsChainSnapshot:
             "signal_score": self.signal_score,
             "unusual_call_strikes": self.unusual_call_strikes[:3],
             "unusual_put_strikes": self.unusual_put_strikes[:3],
+            "data_age_minutes": age,
+            "is_stale": self.is_stale,
+            "staleness_note": (
+                "Options data may be 3-5 min delayed on NSE public feed. "
+                "On event days this can cover the entire tradeable window. "
+                "Discount this signal if data_age_minutes > 5."
+            ) if self.is_stale else None,
         }
 
 

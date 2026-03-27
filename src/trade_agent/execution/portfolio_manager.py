@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from trade_agent.execution.order_executor import Order
 from trade_agent.utils.logger import get_logger
 
+# Sentinel used when a symbol has no sector classification
+_UNKNOWN_SECTOR = "Unknown"
+
 log = get_logger(__name__)
 
 
@@ -90,18 +93,26 @@ class PortfolioManager:
     Args:
         max_open_positions: Hard cap on simultaneous open positions.
         max_trade_amount: Max INR to deploy per trade (used for capacity checks).
+        max_sector_positions: Max simultaneous positions in any single sector.
+            Prevents correlated blow-ups when multiple holdings are hit by the
+            same sector-wide event.  Symbols without a known sector are grouped
+            together under ``_UNKNOWN_SECTOR`` and subject to the same cap.
     """
 
     def __init__(
         self,
         max_open_positions: int = 5,
         max_trade_amount: float = 10_000.0,
+        max_sector_positions: int = 2,
     ) -> None:
         self._max_positions = max_open_positions
         self._max_trade_amount = max_trade_amount
+        self._max_sector_positions = max_sector_positions
         self._positions: dict[str, Position] = {}
         self._closed_trades: list[ClosedTrade] = []
         self._realised_pnl: float = 0.0
+        # Tracks which sector each open position belongs to (symbol → sector)
+        self._position_sectors: dict[str, str] = {}
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
@@ -129,14 +140,38 @@ class PortfolioManager:
     def has_position(self, symbol: str) -> bool:
         return symbol.upper() in self._positions
 
-    def can_open(self, symbol: str) -> bool:
-        """Return True if a new position can be opened for ``symbol``."""
+    def sector_position_count(self, sector: str) -> int:
+        """Return number of open positions in ``sector``."""
+        return sum(1 for s in self._position_sectors.values() if s == sector)
+
+    def can_open(self, symbol: str, sector: str | None = None) -> bool:
+        """Return True if a new position can be opened for ``symbol``.
+
+        Args:
+            symbol: NSE/BSE symbol to open.
+            sector: Sector classification for the symbol (optional).  When
+                provided, the sector concentration cap is enforced.  Pass
+                ``None`` to skip the sector check (e.g. when sector data is
+                unavailable).
+        """
         if self.has_position(symbol):
             log.debug("cannot_open_duplicate", symbol=symbol)
             return False
         if self.position_count >= self._max_positions:
             log.warning("max_positions_reached", count=self.position_count, max=self._max_positions)
             return False
+        if sector is not None:
+            resolved = sector or _UNKNOWN_SECTOR
+            count = self.sector_position_count(resolved)
+            if count >= self._max_sector_positions:
+                log.warning(
+                    "sector_cap_reached",
+                    symbol=symbol,
+                    sector=resolved,
+                    count=count,
+                    max=self._max_sector_positions,
+                )
+                return False
         return True
 
     # ── Mutations ─────────────────────────────────────────────────────────────
@@ -150,6 +185,7 @@ class PortfolioManager:
         take_profit: float,
         entry_order: Order,
         sl_order: Order | None,
+        sector: str | None = None,
     ) -> Position:
         """Record a new open position.
 
@@ -161,6 +197,7 @@ class PortfolioManager:
             take_profit: Take-profit price.
             entry_order: The filled entry order.
             sl_order: The pending stop-loss order (or None in paper mode).
+            sector: Sector classification (stored for concentration cap tracking).
 
         Returns:
             The new :class:`Position`.
@@ -178,6 +215,7 @@ class PortfolioManager:
             current_price=entry_price,
         )
         self._positions[key] = pos
+        self._position_sectors[key] = sector or _UNKNOWN_SECTOR
         log.info(
             "position_opened",
             symbol=key,
@@ -185,6 +223,7 @@ class PortfolioManager:
             entry=entry_price,
             sl=stop_loss,
             tp=take_profit,
+            sector=self._position_sectors[key],
         )
         return pos
 
@@ -217,6 +256,7 @@ class PortfolioManager:
         """
         key = symbol.upper()
         pos = self._positions.pop(key, None)
+        self._position_sectors.pop(key, None)
         if pos is None:
             log.warning("close_no_position", symbol=key)
             return None
@@ -266,12 +306,17 @@ class PortfolioManager:
 
     def summary(self) -> dict[str, object]:
         """Return a portfolio summary dict."""
+        # Aggregate sector exposure
+        sector_counts: dict[str, int] = {}
+        for sec in self._position_sectors.values():
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
         return {
             "open_positions": self.position_count,
             "realised_pnl": round(self._realised_pnl, 2),
             "unrealised_pnl": round(self.unrealised_pnl, 2),
             "total_pnl": round(self.total_pnl, 2),
             "positions": [p.to_dict() for p in self._positions.values()],
+            "sector_exposure": sector_counts,
             "total_trades": len(self._closed_trades),
             "winning_trades": sum(1 for t in self._closed_trades if t.pnl > 0),
             "losing_trades": sum(1 for t in self._closed_trades if t.pnl < 0),

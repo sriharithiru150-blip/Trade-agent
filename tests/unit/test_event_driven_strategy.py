@@ -177,3 +177,38 @@ class TestEventDrivenStrategy:
             liquidity=_liquid(),
         )
         assert result.should_trade is True
+
+    def test_atr_stop_below_pct_stop_on_volatile_stock(self) -> None:
+        # Build a high-volatility history to force ATR stop to be wider than 3%
+        rng = np.random.default_rng(42)
+        n = 60
+        close = 2500.0 + np.cumsum(rng.normal(0, 5, n))
+        high = close + 50.0   # wide daily range → high ATR
+        low = close - 50.0
+        vol = rng.integers(400_000, 600_000, n).astype(float)
+        idx = pd.date_range("2024-01-01", periods=n, freq="D", tz="UTC")
+        volatile_hist = pd.DataFrame(
+            {"Open": close, "High": high, "Low": low, "Close": close, "Volume": vol},
+            index=idx,
+        )
+        result = self.strategy.evaluate(
+            "RELIANCE", None, volatile_hist, [],
+            evidence=_bullish_evidence(conviction=0.75),
+            liquidity=_liquid(),
+        )
+        if result.direction == "LONG":
+            # ATR stop should be below entry
+            assert result.stop_loss < result.entry_price
+            # With ±50 daily range, ATR14 ≈ 100; 1.5×100=150; stop = entry-150
+            # That's much wider than 3%, confirming ATR stop is in effect
+            pct_stop = (result.entry_price - result.stop_loss) / result.entry_price
+            assert pct_stop > 0.03   # wider than the old fixed 3%
+
+    def test_rationale_contains_atr_info(self) -> None:
+        result = self.strategy.evaluate(
+            "RELIANCE", None, self.hist, [],
+            evidence=_bullish_evidence(conviction=0.75),
+            liquidity=_liquid(),
+        )
+        if result.direction == "LONG":
+            assert "ATR" in result.rationale or "pct-fallback" in result.rationale

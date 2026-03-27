@@ -100,29 +100,180 @@ _TYPE_KEYWORDS: list[tuple[list[str], EventType]] = [
     (["ceo", "cfo", "coo", "md ", "managing director", "director resign", "director appoint"], EventType.MANAGEMENT_CHANGE),
 ]
 
-# Expected directional impact per event type  (+1 bullish, -1 bearish, 0 neutral)
-EVENT_DIRECTION: dict[EventType, int] = {
-    EventType.BOARD_MEETING: 0,
-    EventType.RESULTS: 0,        # depends on actual numbers
-    EventType.DIVIDEND: 1,
-    EventType.BONUS: 1,
-    EventType.SPLIT: 1,
-    EventType.BUYBACK: 1,
-    EventType.QIP: -1,           # dilutive
-    EventType.RIGHTS_ISSUE: -1,  # dilutive
-    EventType.MERGER_ACQUISITION: 0,
-    EventType.DEMERGER: 1,       # typically unlocks value
-    EventType.PROMOTER_PLEDGE: -1,
-    EventType.PROMOTER_BUY: 1,
-    EventType.PROMOTER_SELL: -1,
-    EventType.SEBI_ORDER: -1,
-    EventType.CREDIT_RATING: 0,  # depends on direction
-    EventType.DEBT_DEFAULT: -1,
-    EventType.MANAGEMENT_CHANGE: 0,
-    EventType.BULK_DEAL: 0,      # scored separately by buyer/seller type
-    EventType.BLOCK_DEAL: 0,
-    EventType.OTHER: 0,
+# ── Market cap tiers for freshness windows ────────────────────────────────────
+# Nifty 50 algos reprice in seconds; mid-caps take longer.
+# Freshness window = maximum event age (minutes) that still carries edge.
+
+class MarketCapTier(str, Enum):
+    LARGE = "large"    # Nifty 50 — window 15 min
+    MID   = "mid"      # Nifty 51-500 — window 45 min
+    SMALL = "small"    # Below Nifty 500 / unknown — window 90 min
+
+FRESHNESS_WINDOW: dict[MarketCapTier, int] = {
+    MarketCapTier.LARGE: 15,
+    MarketCapTier.MID:   45,
+    MarketCapTier.SMALL: 90,
 }
+
+# Static Nifty 50 membership (as of 2025)
+_NIFTY50: frozenset[str] = frozenset({
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR", "ITC",
+    "SBIN", "BAJFINANCE", "BHARTIARTL", "KOTAKBANK", "LT", "AXISBANK",
+    "ASIANPAINT", "MARUTI", "TITAN", "SUNPHARMA", "ULTRACEMCO", "WIPRO",
+    "NESTLEIND", "ONGC", "NTPC", "POWERGRID", "TECHM", "HCLTECH",
+    "TATAMOTORS", "JSWSTEEL", "TATASTEEL", "ADANIENT", "ADANIPORTS",
+    "BAJAJFINSV", "BAJAJ-AUTO", "HEROMOTOCO", "DRREDDY", "CIPLA",
+    "DIVISLAB", "EICHERMOT", "COALINDIA", "BPCL", "HINDALCO",
+    "APOLLOHOSP", "TATACONSUM", "BRITANNIA", "SBILIFE", "HDFCLIFE",
+    "M&M", "GRASIM", "INDUSINDBK", "UPL", "SHREECEM",
+})
+
+# Nifty 100 additions (51-100)
+_NIFTY_NEXT50: frozenset[str] = frozenset({
+    "DMART", "VEDL", "SIEMENS", "HAVELLS", "PIDILITIND", "BERGEPAINT",
+    "MCDOWELL-N", "COLPAL", "GODREJCP", "DABUR", "MARICO", "MUTHOOTFIN",
+    "BANKBARODA", "PNB", "CANBK", "UNIONBANK", "FEDERALBNK", "IDFCFIRSTB",
+    "BANDHANBNK", "RBLBANK", "CHOLAFIN", "BAJAJHLDNG", "LICHSGFIN",
+    "ABCAPITAL", "MANAPPURAM", "PFC", "RECLTD", "IRFC",
+    "TATAPOWER", "ADANIGREEN", "ADANITRANS", "TORNTPOWER", "CESC",
+    "GAIL", "IOC", "HINDPETRO", "MGL", "IGL",
+    "LUPIN", "AUROPHARMA", "TORNTPHARM", "ALKEM", "LALPATHLAB",
+    "FORTIS", "MAXHEALTH", "METROPOLIS",
+    "ZOMATO", "PAYTM", "NYKAA", "POLICYBZR",
+})
+
+_NIFTY_MIDCAP: frozenset[str] = frozenset({
+    "VOLTAS", "WHIRLPOOL", "BLUESTAR", "CROMPTON", "POLYCAB", "KEI",
+    "ASTRAL", "SUPREMIND", "AARTIIND", "DEEPAKNI", "SRF", "ALKYLAMINE",
+    "LAXMIMACH", "ELGIEQUIP", "GREAVESCOT", "SCHAEFFLER", "TIMKEN",
+    "PAGEIND", "RELAXO", "BATAINDIA", "VIPIND",
+    "PERSISTENT", "MPHASIS", "LTTS", "COFORGE", "KPITTECH",
+    "IRCTC", "CONCOR", "BLUEDART", "MAHLOG",
+    "APLAPOLLO", "JSPL", "SAIL", "NMDC", "MOIL",
+    "CAMS", "CDSL", "BSE", "MCX",
+    "ABSLAMC", "HDFCAMC", "ICICIGI", "SBICARD",
+})
+
+
+def get_market_cap_tier(symbol: str) -> MarketCapTier:
+    """Return the market cap tier for a symbol (used for freshness windowing).
+
+    Args:
+        symbol: NSE stock symbol (uppercase).
+
+    Returns:
+        :class:`MarketCapTier` — LARGE, MID, or SMALL.
+    """
+    sym = symbol.upper().strip()
+    if sym in _NIFTY50:
+        return MarketCapTier.LARGE
+    if sym in _NIFTY_NEXT50 or sym in _NIFTY_MIDCAP:
+        return MarketCapTier.MID
+    return MarketCapTier.SMALL
+
+
+def get_freshness_window(symbol: str) -> int:
+    """Return the maximum event age in minutes that still carries edge.
+
+    Large caps (Nifty 50) get a 15-minute window — algos reprice within
+    seconds; retail still has a few minutes on less-watched names.
+    Mid-caps get 45 minutes.  Small-caps get 90 minutes.
+
+    Args:
+        symbol: NSE stock symbol.
+
+    Returns:
+        Maximum event age in minutes.
+    """
+    return FRESHNESS_WINDOW[get_market_cap_tier(symbol)]
+
+
+# ── Contextual direction scoring ──────────────────────────────────────────────
+# Base direction per event type.  Some types (QIP, credit rating, management
+# change) need headline context to determine actual direction — see
+# score_event_direction() below for the full logic.
+
+_BASE_DIRECTION: dict[EventType, float] = {
+    EventType.BOARD_MEETING:      0.0,
+    EventType.RESULTS:            0.0,   # requires actual numbers
+    EventType.DIVIDEND:           0.8,   # mostly positive; sometimes signals mature/no-growth
+    EventType.BONUS:              0.8,
+    EventType.SPLIT:              0.6,
+    EventType.BUYBACK:            1.0,   # clear positive: management buying at premium
+    EventType.QIP:                0.0,   # context-dependent — see score_event_direction()
+    EventType.RIGHTS_ISSUE:      -0.5,   # usually dilutive, occasionally growth signal
+    EventType.MERGER_ACQUISITION: 0.0,   # acquirer often dips; target rises
+    EventType.DEMERGER:           0.7,   # unlocks value typically
+    EventType.PROMOTER_PLEDGE:   -0.9,   # near-always bearish
+    EventType.PROMOTER_BUY:       0.9,
+    EventType.PROMOTER_SELL:     -0.7,
+    EventType.SEBI_ORDER:        -0.9,
+    EventType.CREDIT_RATING:      0.0,   # context-dependent — see score_event_direction()
+    EventType.DEBT_DEFAULT:      -1.0,
+    EventType.MANAGEMENT_CHANGE:  0.0,   # context-dependent — see score_event_direction()
+    EventType.BULK_DEAL:          0.0,   # scored separately via flow_score
+    EventType.BLOCK_DEAL:         0.0,
+    EventType.OTHER:              0.0,
+}
+
+# Retained for backward-compat (used in to_dict as integer approximation)
+EVENT_DIRECTION: dict[EventType, int] = {k: int(round(v)) for k, v in _BASE_DIRECTION.items()}
+
+
+def score_event_direction(event_type: EventType, headline: str) -> float:
+    """Return a contextual direction score in [-1.0, 1.0].
+
+    For event types where context matters (QIP, credit rating, management
+    change), this parses the headline to refine the direction beyond the
+    flat base value.
+
+    Args:
+        event_type: The classified event type.
+        headline: Raw headline text from the filing.
+
+    Returns:
+        Directional score: positive = bullish, negative = bearish.
+    """
+    base = _BASE_DIRECTION.get(event_type, 0.0)
+    text = headline.lower()
+
+    if event_type == EventType.QIP:
+        # Capex / expansion QIP → mildly positive; distress / debt QIP → negative
+        if any(k in text for k in ["capex", "expansion", "growth", "acquisition fund"]):
+            return 0.3
+        if any(k in text for k in ["debt", "npa", "repay", "loss", "distress"]):
+            return -0.8
+        return -0.3   # default: mild dilution concern
+
+    if event_type == EventType.CREDIT_RATING:
+        if any(k in text for k in ["upgrade", "positive outlook", "watch positive"]):
+            return 0.8
+        if any(k in text for k in ["downgrade", "negative outlook", "watch negative", "default"]):
+            return -0.9
+        if any(k in text for k in ["affirm", "reaffirm", "stable"]):
+            return 0.1
+        return 0.0
+
+    if event_type == EventType.MANAGEMENT_CHANGE:
+        if any(k in text for k in ["resign", "stepped down", "vacates", "dismissed"]):
+            return -0.5
+        if any(k in text for k in ["appoint", "joins", "takes charge", "elevated"]):
+            return 0.2
+        return 0.0
+
+    if event_type == EventType.RESULTS:
+        # Without actual numbers we can't score; caller must use Claude
+        return 0.0
+
+    if event_type == EventType.MERGER_ACQUISITION:
+        # Acquiring company (buyer) typically dips; target spikes
+        if any(k in text for k in ["acquires", "acquirer", "buys", "purchase"]):
+            return -0.2   # buyer — uncertain
+        if any(k in text for k in ["acquired", "takeover", "bid received"]):
+            return 0.8    # target — premium expected
+        return 0.0
+
+    return base
 
 # Urgency weight — how quickly price typically reacts
 EVENT_URGENCY: dict[EventType, float] = {
@@ -169,11 +320,27 @@ class CorporateEvent:
 
     @property
     def direction(self) -> int:
-        return EVENT_DIRECTION.get(self.event_type, 0)
+        """Integer direction for backward compat (-1/0/1)."""
+        return int(round(self.direction_score))
+
+    @property
+    def direction_score(self) -> float:
+        """Contextual direction score [-1.0, 1.0], headline-aware."""
+        return score_event_direction(self.event_type, self.headline)
 
     @property
     def urgency(self) -> float:
         return EVENT_URGENCY.get(self.event_type, 0.2)
+
+    @property
+    def freshness_window(self) -> int:
+        """Maximum age in minutes for this event to still carry edge."""
+        return get_freshness_window(self.symbol)
+
+    @property
+    def is_fresh(self) -> bool:
+        """True if the event is within the tier-appropriate freshness window."""
+        return self.age_minutes <= self.freshness_window
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -184,8 +351,10 @@ class CorporateEvent:
             "detail": self.detail[:300],
             "filing_time": self.filing_time.isoformat(),
             "age_minutes": round(self.age_minutes, 1),
-            "direction": self.direction,
+            "direction_score": round(self.direction_score, 2),
             "urgency": self.urgency,
+            "freshness_window_minutes": self.freshness_window,
+            "is_fresh": self.is_fresh,
         }
 
 
