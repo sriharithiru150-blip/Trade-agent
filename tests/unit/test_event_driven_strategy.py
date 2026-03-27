@@ -52,7 +52,7 @@ def _illiquid() -> LiquidityProfile:
     return liq
 
 
-def _fresh_event(event_type: EventType = EventType.BUYBACK, age: float = 15.0) -> CorporateEvent:
+def _fresh_event(event_type: EventType = EventType.BUYBACK, age: float = 8.0) -> CorporateEvent:
     filed = datetime.now(timezone.utc) - timedelta(minutes=age)
     return CorporateEvent(
         symbol="RELIANCE",

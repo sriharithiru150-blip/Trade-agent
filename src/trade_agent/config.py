@@ -44,10 +44,40 @@ class Settings(BaseSettings):
         2, description="Max simultaneous positions in any single sector"
     )
     stop_loss_pct: Annotated[float, Field(gt=0, lt=1)] = Field(
-        0.02, description="Stop-loss as fraction of entry price"
+        0.02, description="Stop-loss as fraction of entry price (fallback when ATR unavailable)"
     )
     take_profit_pct: Annotated[float, Field(gt=0, lt=1)] = Field(
-        0.04, description="Take-profit as fraction of entry price"
+        0.04, description="Take-profit as fraction of entry price (fallback when ATR unavailable)"
+    )
+
+    # ── Intraday mode ─────────────────────────────────────────────────────────
+    intraday_mode: bool = Field(
+        False,
+        description=(
+            "When True: use 5-min ATR, tighter freshness windows (5/15/30 min), "
+            "₹50Cr ADV floor, 2-min options staleness, and exit by EOD_SQUARE_OFF_MINUTES"
+        ),
+    )
+    eod_square_off_minutes: Annotated[int, Field(ge=1, le=90)] = Field(
+        30,
+        description=(
+            "Minutes before market close to trigger end-of-day square-off. "
+            "30 min (15:00 IST) is recommended for intraday to avoid 15:15 rush."
+        ),
+    )
+    intraday_adv_floor_cr: Annotated[float, Field(gt=0)] = Field(
+        50.0,
+        description=(
+            "Minimum ADV in crores for intraday trading. "
+            "Intraday needs tighter spreads than swing — ₹50Cr vs ₹20Cr default."
+        ),
+    )
+    intraday_options_staleness_minutes: Annotated[float, Field(gt=0)] = Field(
+        2.0,
+        description=(
+            "Options snapshot age (minutes) above which it's considered stale in intraday mode. "
+            "NSE refreshes the public feed every 3-5 min; for intraday 2 min is the effective limit."
+        ),
     )
 
     # ── Watchlist ─────────────────────────────────────────────────────────────

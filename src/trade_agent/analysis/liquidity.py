@@ -99,7 +99,8 @@ class SlippageModel:
 # ── Minimum liquidity thresholds ─────────────────────────────────────────────
 
 # Minimum 20-day average daily turnover to be tradeable for our position sizes
-_MIN_ADV_CR = 5.0           # ₹5 crore minimum average daily value
+_MIN_ADV_CR = 5.0            # ₹5 crore minimum for swing positions
+_MIN_ADV_CR_INTRADAY = 50.0  # ₹50 crore minimum for intraday — need tight spreads
 _IMPACT_COST_THRESHOLD = 0.10  # maximum acceptable impact cost %
 
 
@@ -108,6 +109,7 @@ def compute_liquidity_profile(
     history: pd.DataFrame,
     current_price: float,
     max_trade_amount: float = 10_000.0,
+    intraday_mode: bool = False,
 ) -> LiquidityProfile:
     """Compute liquidity characteristics from OHLCV history.
 
@@ -116,6 +118,8 @@ def compute_liquidity_profile(
         history: Daily OHLCV DataFrame (at least 20 rows).
         current_price: Latest price for impact cost estimation.
         max_trade_amount: Intended position size in INR.
+        intraday_mode: When True, applies ₹50Cr ADV floor instead of ₹5Cr.
+            Intraday positions need tighter spreads and faster fills.
 
     Returns:
         :class:`LiquidityProfile` with tier classification and cost estimates.
@@ -150,15 +154,21 @@ def compute_liquidity_profile(
     )
 
     # Tier classification
+    # Intraday requires tighter spreads: raise the floor to ₹50Cr
+    min_adv = _MIN_ADV_CR_INTRADAY if intraday_mode else _MIN_ADV_CR
     if avg_daily_value_cr >= 100:
         tier = "high"
         is_liquid = True
         max_pos = min(max_trade_amount, avg_daily_value_cr * 1e7 * 0.005)  # 0.5% of ADV
-    elif avg_daily_value_cr >= 20:
+    elif avg_daily_value_cr >= 50:
         tier = "medium"
         is_liquid = True
         max_pos = min(max_trade_amount, avg_daily_value_cr * 1e7 * 0.003)
-    elif avg_daily_value_cr >= _MIN_ADV_CR:
+    elif avg_daily_value_cr >= 20:
+        tier = "low"
+        is_liquid = not intraday_mode and impact_pct < _IMPACT_COST_THRESHOLD
+        max_pos = min(max_trade_amount, avg_daily_value_cr * 1e7 * 0.001)
+    elif avg_daily_value_cr >= min_adv:
         tier = "low"
         is_liquid = impact_pct < _IMPACT_COST_THRESHOLD
         max_pos = min(max_trade_amount, avg_daily_value_cr * 1e7 * 0.001)

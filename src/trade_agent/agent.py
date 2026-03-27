@@ -214,7 +214,8 @@ _TOOLS: list[dict[str, Any]] = [
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """You are an expert AI trading agent specialising in Indian equity markets (NSE/BSE).
+_SYSTEM_PROMPT_SWING = """You are an expert AI trading agent specialising in Indian equity markets (NSE/BSE).
+Operating in SWING mode: target 2-10 session holds, ATR-based stops (1.5×ATR14 daily), freshness 15/45/90 min.
 
 ## Your edge
 You trade on INFORMATION EVENTS filed directly with stock exchanges — not on lagging technical patterns or
@@ -236,7 +237,7 @@ exchange-filed material events, cross-referencing them with institutional flow d
 ## What NOT to do
 - Do NOT trade purely on RSI/MACD signals with no event catalyst.
 - Do NOT trade on news from public feeds — it is already priced in.
-- Do NOT enter illiquid stocks (ADV < ₹5 Cr) — slippage will destroy the edge.
+- Do NOT enter stocks with ADV < ₹20 Cr — slippage will destroy the edge.
 - Do NOT open more than the configured max_open_positions simultaneously.
 - Do NOT ignore the liquidity-adjusted break-even cost when setting stop-loss.
 
@@ -245,8 +246,7 @@ exchange-filed material events, cross-referencing them with institutional flow d
 - Minimum risk:reward = 2:1 AFTER transaction costs.
 - If India VIX > 22: reduce position size by 50%.
 - If Nifty is down > 2% intraday: no new entries regardless of individual signals.
-- Square off all positions at or before 15:15 IST if holding intraday (for swing positions,
-  apply the configured take-profit/stop-loss targets instead).
+- For swing holds: apply configured take-profit/stop-loss targets; EOD square-off by the configured time.
 
 ## Output format (after completing analysis)
 Provide a structured summary:
@@ -257,6 +257,60 @@ Provide a structured summary:
 5. Current portfolio status
 6. Any elevated risks or observations
 """
+
+_SYSTEM_PROMPT_INTRADAY = """You are an expert AI trading agent specialising in Indian equity markets (NSE/BSE).
+Operating in INTRADAY mode: all positions MUST be closed before EOD square-off trigger.
+ATR computed from 5-min candles. Stop: ~0.5% (ATR-based). Target: ~1.2% (2.4:1 R:R min).
+Freshness windows: Nifty50=5 min, mid-cap=15 min, small-cap=30 min.
+Options data stale after 2 min in intraday mode. ADV floor: ₹50 Cr.
+
+## Your edge
+You react to SAME-DAY exchange events that move intraday price — pre-market bulk deals filed before 9:15,
+intraday block deal window (9:15–9:50), and unusual intraday options OI buildup ahead of a catalyst.
+Your advantage is processing these signals faster than retail traders.
+
+## Analysis process (follow this order)
+1. `get_market_overview` — assess Nifty/Sensex/VIX. If Nifty is down >1.5% or VIX > 22, raise
+   the conviction bar to ≥ 0.75 before entering. No new entries if Nifty down > 2%.
+2. `get_corporate_events` (no symbol filter) — scan for events within the 5/15/30 min intraday window.
+   Events older than the intraday window are already priced — skip them.
+3. For each symbol with a fresh intraday event:
+   a. `get_institutional_flows` — pre-market bulk deals are the strongest intraday signal.
+   b. `get_options_positioning` — check PCR and unusual OI buildup. NOTE: options data may
+      be up to 2 min stale; treat with caution during fast-moving events.
+   c. `get_stock_technicals` — verify ADV ≥ ₹50 Cr. Check 5-min ATR for stop placement.
+   d. `score_opportunity` — conviction must be ≥ 0.65 for intraday (tighter than swing).
+4. `get_portfolio_status` — check capacity. Intraday: max 3 simultaneous positions recommended.
+5. Only enter if: fresh event + conviction ≥ 0.65 + ADV ≥ ₹50 Cr + R:R ≥ 2.4:1 after costs.
+
+## What NOT to do
+- Do NOT enter on events older than the intraday freshness window — they are already priced.
+- Do NOT enter stocks with ADV < ₹50 Cr intraday — spread will eat the target.
+- Do NOT let any position survive past the EOD square-off trigger — no exceptions.
+- Do NOT use daily RSI/MACD as intraday signals — use 5-min price action and event flow only.
+- Do NOT enter if fewer than 90 minutes remain until market close.
+
+## Risk rules (non-negotiable)
+- Stop-loss from 5-min ATR (1.5×ATR). Maximum stop 0.8% for intraday.
+- Minimum risk:reward = 2.4:1 AFTER transaction costs (target ≥ 1.2% for 0.5% stop).
+- If India VIX > 22: no new intraday entries.
+- If Nifty is down > 1.5% intraday: no new entries.
+- ALL positions must be closed at or before the EOD square-off time — hard rule.
+- If a position hits stop-loss, do NOT re-enter the same stock that session.
+
+## Output format (after completing analysis)
+Provide a structured summary:
+1. Market conditions (Nifty, VIX, breadth)
+2. Fresh intraday events found and their age/tier
+3. Symbols analysed with conviction scores and ATR stop levels
+4. Trades taken (or explicitly skipped with reason)
+5. Current portfolio status and time to EOD cutoff
+6. Any elevated risks
+"""
+
+
+def _build_system_prompt(intraday_mode: bool) -> str:
+    return _SYSTEM_PROMPT_INTRADAY if intraday_mode else _SYSTEM_PROMPT_SWING
 
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
@@ -292,6 +346,7 @@ class TradingAgent:
         self._portfolio = PortfolioManager(
             max_open_positions=settings.max_open_positions,
             max_trade_amount=settings.max_trade_amount,
+            max_sector_positions=settings.max_sector_positions,
         )
 
         # Strategy
@@ -300,6 +355,7 @@ class TradingAgent:
             stop_loss_pct=settings.stop_loss_pct,
             take_profit_pct=settings.take_profit_pct,
             max_trade_amount=settings.max_trade_amount,
+            intraday_mode=settings.intraday_mode,
         )
 
         # Per-cycle cache so tools don't re-fetch within the same run
@@ -330,11 +386,15 @@ class TradingAgent:
         log.info("agent_cycle_start", time=now_ist().isoformat())
         watchlist = self._settings.get_watchlist()
 
+        ist_now = now_ist()
+        mode = "INTRADAY" if self._settings.intraday_mode else "SWING"
         initial_message = (
             f"Run a full event-driven market analysis cycle.\n"
+            f"Mode: {mode}\n"
             f"Watchlist: {', '.join(watchlist)}\n"
-            f"Current IST time: {now_ist().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"DRY_RUN: {self._settings.dry_run}\n\n"
+            f"Current IST time: {ist_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"DRY_RUN: {self._settings.dry_run}\n"
+            f"EOD square-off: {self._settings.eod_square_off_minutes} min before close\n\n"
             f"Start with get_market_overview, then scan for new corporate events "
             f"across the full market. Investigate any material events on watchlist "
             f"symbols or any symbol with significant institutional flow."
@@ -342,12 +402,13 @@ class TradingAgent:
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": initial_message}]
         final_text = ""
+        system_prompt = _build_system_prompt(self._settings.intraday_mode)
 
         for _ in range(25):  # hard cap on iterations
             response = self._client.messages.create(
                 model=self._settings.claude_model,
                 max_tokens=4096,
-                system=_SYSTEM_PROMPT,
+                system=system_prompt,
                 tools=_TOOLS,  # type: ignore[arg-type]
                 messages=messages,
             )
@@ -489,12 +550,18 @@ class TradingAgent:
         events = self._event_scraper.get_announcements(
             symbol=symbol, new_only=True
         )
+        mode = "intraday" if self._settings.intraday_mode else "swing"
         result = {
             "count": len(events),
             "events": [e.to_dict() for e in events],
+            "mode": mode,
             "note": (
-                "These are events filed directly with NSE — as fresh as possible. "
-                "Focus on events with urgency ≥ 0.7 filed within the last 90 minutes."
+                "Events filed directly with NSE. "
+                f"Freshness windows ({mode} mode): "
+                "Nifty50=5m/mid=15m/small=30m for intraday, "
+                "Nifty50=15m/mid=45m/small=90m for swing. "
+                "is_fresh_intraday and is_fresh fields in each event show whether "
+                "it is within the relevant window."
             ),
         }
         self._cycle_cache[cache_key] = result
@@ -558,13 +625,25 @@ class TradingAgent:
 
         try:
             quote = self._market_data.get_quote(symbol)
-            history = self._market_data.get_history(symbol, period="3mo", interval="1d")
-            snap = compute_technical_snapshot(history)
+            # Daily history for liquidity profile and technical snapshot
+            daily_history = self._market_data.get_history(symbol, period="3mo", interval="1d")
+            snap = compute_technical_snapshot(daily_history)
             liq = compute_liquidity_profile(
-                symbol, history, quote.price, self._settings.max_trade_amount
+                symbol,
+                daily_history,
+                quote.price,
+                self._settings.max_trade_amount,
+                intraday_mode=self._settings.intraday_mode,
             )
-            # Cache objects for use by score_opportunity
-            self._cycle_cache[f"_history_{symbol}"] = history
+            # In intraday mode, also fetch 5-min bars for ATR-based stop placement
+            if self._settings.intraday_mode:
+                try:
+                    intraday_history = self._market_data.get_intraday(symbol, interval="5m")
+                    self._cycle_cache[f"_history_{symbol}"] = intraday_history
+                except Exception:
+                    self._cycle_cache[f"_history_{symbol}"] = daily_history
+            else:
+                self._cycle_cache[f"_history_{symbol}"] = daily_history
             self._cycle_cache[f"_technical_obj_{symbol}"] = snap
             self._cycle_cache[f"_liquidity_obj_{symbol}"] = liq
 
@@ -596,7 +675,21 @@ class TradingAgent:
         deals = self._event_scraper.get_deals_for_symbol(symbol)
         options = self._cycle_cache.get(f"_options_obj_{symbol}")
 
-        evidence = self._scorer.score(symbol, events, deals, options)
+        liq = self._cycle_cache.get(f"_liquidity_obj_{symbol}")
+        adv_cr = liq.avg_daily_value_cr if liq is not None else None
+        evidence = self._scorer.score(
+            symbol,
+            events,
+            deals,
+            options,
+            adv_cr=adv_cr,
+            intraday_mode=self._settings.intraday_mode,
+            options_staleness_minutes=(
+                self._settings.intraday_options_staleness_minutes
+                if self._settings.intraday_mode
+                else 5.0
+            ),
+        )
         # Cache for use by execute_trade
         self._cycle_cache[f"_evidence_{symbol}"] = evidence
 
@@ -624,11 +717,18 @@ class TradingAgent:
         thesis = str(inputs.get("thesis", ""))
         holding_days = int(inputs.get("holding_period_days", 3))
 
-        # Portfolio capacity
-        if not self._portfolio.can_open(symbol):
+        # Resolve sector for concentration cap
+        try:
+            profile = self._company_graph.get_profile(symbol)
+            sector = profile.sector if profile else None
+        except Exception:
+            sector = None
+
+        # Portfolio capacity (includes sector concentration check)
+        if not self._portfolio.can_open(symbol, sector=sector):
             return {
                 "status": "rejected",
-                "reason": "Duplicate position or max positions reached.",
+                "reason": "Duplicate position, max positions reached, or sector cap hit.",
             }
 
         # Validate R:R (minimum 2:1)
@@ -684,6 +784,7 @@ class TradingAgent:
             take_profit=take_profit,
             entry_order=entry_order,
             sl_order=sl_order,
+            sector=sector,
         )
 
         return {

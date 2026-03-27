@@ -44,6 +44,8 @@ def main() -> None:
         "trade_agent_starting",
         model=settings.claude_model,
         dry_run=settings.dry_run,
+        intraday_mode=settings.intraday_mode,
+        eod_square_off_minutes=settings.eod_square_off_minutes,
         watchlist=settings.get_watchlist(),
         interval_minutes=settings.analysis_interval_minutes,
     )
@@ -73,11 +75,11 @@ def main() -> None:
         except Exception as exc:
             log.error("cycle_failed", error=str(exc), exc_info=True)
 
-        # End-of-day: square off all positions 15 min before market close
+        # End-of-day: square off all positions N min before market close
         now = now_ist()
         close = market_close_ist()
         minutes_to_close = (close - now).total_seconds() / 60
-        if 0 < minutes_to_close <= 15:
+        if 0 < minutes_to_close <= settings.eod_square_off_minutes:
             log.info("eod_squareoff_trigger", minutes_to_close=round(minutes_to_close, 1))
             result = agent.square_off_all()
             log.info("eod_result", **result)

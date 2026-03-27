@@ -94,6 +94,8 @@ class EventScorer:
         deals: list[BulkDeal],
         options: OptionsChainSnapshot | None,
         adv_cr: float | None = None,
+        intraday_mode: bool = False,
+        options_staleness_minutes: float = 5.0,
     ) -> EventEvidence:
         """Compute structured evidence for ``symbol``.
 
@@ -104,13 +106,21 @@ class EventScorer:
             options: Options chain snapshot (may be stale — staleness is flagged).
             adv_cr: 20-day average daily traded value in crores. Used to
                 normalise deal sizes. If None, falls back to relative sizing.
+            intraday_mode: When True, applies tighter intraday freshness windows
+                to event scoring (5/15/30 min instead of 15/45/90 min).
+            options_staleness_minutes: Age threshold above which options weight
+                is reduced.  Pass 2.0 for intraday, keep default 5.0 for swing.
 
         Returns:
             :class:`EventEvidence` with all sub-scores and summaries.
         """
-        event_score, event_summary, event_risks = self._score_events(events)
+        event_score, event_summary, event_risks = self._score_events(
+            events, intraday_mode=intraday_mode
+        )
         flow_score, flow_summary, flow_risks = self._score_flows(deals, adv_cr)
-        opt_score, opt_summary, opt_risks, opt_weight = self._score_options(options)
+        opt_score, opt_summary, opt_risks, opt_weight = self._score_options(
+            options, staleness_minutes=options_staleness_minutes
+        )
 
         # Adjust weights if options data is stale — redistribute to events/flow
         if opt_weight < _W_OPTIONS:
@@ -154,12 +164,15 @@ class EventScorer:
     # ── Sub-scorers ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _score_events(events: list[CorporateEvent]) -> tuple[float, str, list[str]]:
+    def _score_events(
+        events: list[CorporateEvent],
+        intraday_mode: bool = False,
+    ) -> tuple[float, str, list[str]]:
         """Score corporate events using contextual direction_score.
 
         Uses event.direction_score (float, headline-aware) instead of the old
-        flat integer EVENT_DIRECTION map.  Freshness is now tiered by market
-        cap via event.freshness_window.
+        flat integer EVENT_DIRECTION map.  Freshness is tiered by market cap:
+        swing mode 15/45/90 min; intraday mode 5/15/30 min.
         """
         if not events:
             return 0.0, "No recent corporate announcements.", []
@@ -170,20 +183,22 @@ class EventScorer:
         risks: list[str] = []
 
         for evt in events:
+            window = evt.intraday_freshness_window if intraday_mode else evt.freshness_window
             # Freshness: linear decay within the tier's window, zero beyond it
-            if evt.age_minutes > evt.freshness_window:
+            if evt.age_minutes > window:
                 continue   # outside the edge window for this market cap tier
-            freshness = 1.0 - (evt.age_minutes / evt.freshness_window)
+            freshness = 1.0 - (evt.age_minutes / window)
             weight = evt.urgency * max(freshness, 0.05)
-            direction = evt.direction_score   # now a float, contextual
+            direction = evt.direction_score   # float, contextual
 
             weighted_dir += direction * weight
             total_weight += weight
 
+            mode_tag = "intra" if intraday_mode else "swing"
             highlights.append(
                 f"[{evt.event_type.value.upper()}] {evt.headline[:80]} "
                 f"(filed {evt.age_minutes:.0f}m ago, "
-                f"window={evt.freshness_window}m, dir={direction:+.1f})"
+                f"window={window}m [{mode_tag}], dir={direction:+.1f})"
             )
 
             if evt.event_type in (EventType.DEBT_DEFAULT, EventType.SEBI_ORDER):
@@ -194,7 +209,8 @@ class EventScorer:
                 risks.append("Promoter pledging — potential forced selling pressure")
 
         if total_weight == 0:
-            return 0.0, "All events outside freshness window for this stock's market cap tier.", []
+            mode = "intraday" if intraday_mode else "swing"
+            return 0.0, f"All events outside {mode} freshness window for this stock's market cap tier.", []
 
         score = float(min(1.0, max(-1.0, weighted_dir / total_weight)))
         summary = " | ".join(highlights[:5])
@@ -281,12 +297,18 @@ class EventScorer:
     @staticmethod
     def _score_options(
         options: OptionsChainSnapshot | None,
+        staleness_minutes: float = 5.0,
     ) -> tuple[float, str, list[str], float]:
         """Score options positioning. Returns (0–1 score, summary, risks, weight).
 
-        If the snapshot is stale (>5 min), the effective weight returned to
-        the caller is reduced so Claude and the conviction formula are both
-        informed of the reduced confidence.
+        If the snapshot is stale (older than ``staleness_minutes``), the
+        effective weight returned to the caller is reduced so Claude and the
+        conviction formula are both informed of the reduced confidence.
+
+        Args:
+            options: Options chain snapshot, or None.
+            staleness_minutes: Age threshold to call data stale.  Use 2.0 for
+                intraday mode, 5.0 (default) for swing.
         """
         if options is None:
             return 0.5, "No options data available.", [], 0.0
@@ -294,14 +316,16 @@ class EventScorer:
         risks: list[str] = []
         age = options.data_age_minutes
 
-        # Staleness: linearly reduce weight from full at 0 min to 0 at 10 min
-        staleness_factor = max(0.0, 1.0 - (age / 10.0))
+        # Staleness: linearly reduce weight from full at 0 to 0 at 2×threshold
+        decay_window = staleness_minutes * 2.0
+        staleness_factor = max(0.0, 1.0 - (age / decay_window))
         effective_weight = round(_W_OPTIONS * staleness_factor, 4)
+        is_stale = age > staleness_minutes
 
-        if options.is_stale:
+        if is_stale:
             risks.append(
-                f"Options data is {age:.1f} min old (NSE public feed refreshes every "
-                f"3-5 min). On event days this covers the full tradeable window — "
+                f"Options data is {age:.1f} min old (threshold: {staleness_minutes} min). "
+                f"On event days this covers the full tradeable window — "
                 f"options weight reduced to {effective_weight:.2f} (from {_W_OPTIONS})."
             )
         if options.pcr_oi > 1.5:
@@ -313,7 +337,7 @@ class EventScorer:
 
         price = options.underlying_price
         pain_gap = ((options.max_pain - price) / price * 100) if price else 0
-        stale_tag = f" ⚠ DATA {age:.0f}m OLD" if options.is_stale else ""
+        stale_tag = f" ⚠ DATA {age:.0f}m OLD" if is_stale else ""
         summary = (
             f"PCR(OI)={options.pcr_oi:.2f} ({options.sentiment}){stale_tag}, "
             f"MaxPain=₹{options.max_pain:.0f} ({pain_gap:+.1f}% from CMP), "

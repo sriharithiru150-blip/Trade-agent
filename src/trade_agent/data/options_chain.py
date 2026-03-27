@@ -117,10 +117,14 @@ class OptionsChainSnapshot:
         """Minutes since this snapshot was fetched from NSE."""
         return (datetime.now(timezone.utc) - self.fetched_at).total_seconds() / 60
 
+    # Staleness threshold in minutes.  Default 5 min for swing; set to 2 min
+    # for intraday via OptionsChainSnapshot(staleness_minutes=2.0).
+    staleness_minutes: float = 5.0
+
     @property
     def is_stale(self) -> bool:
-        """NSE public API refreshes every 3-5 min; flag if older than 5 min."""
-        return self.data_age_minutes > 5.0
+        """True if the snapshot is older than ``staleness_minutes``."""
+        return self.data_age_minutes > self.staleness_minutes
 
     def to_dict(self) -> dict[str, object]:
         age = round(self.data_age_minutes, 1)
@@ -140,9 +144,9 @@ class OptionsChainSnapshot:
             "data_age_minutes": age,
             "is_stale": self.is_stale,
             "staleness_note": (
-                "Options data may be 3-5 min delayed on NSE public feed. "
-                "On event days this can cover the entire tradeable window. "
-                "Discount this signal if data_age_minutes > 5."
+                f"Options data is {age} min old (staleness threshold: "
+                f"{self.staleness_minutes} min). On event days this can cover the "
+                "entire tradeable window. Discount this signal accordingly."
             ) if self.is_stale else None,
         }
 

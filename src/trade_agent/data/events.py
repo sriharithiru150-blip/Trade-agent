@@ -115,6 +115,14 @@ FRESHNESS_WINDOW: dict[MarketCapTier, int] = {
     MarketCapTier.SMALL: 90,
 }
 
+# Intraday freshness windows — tighter because algos reprice Nifty50 within
+# seconds; even mid-caps are efficiently priced within 15 min during market hours.
+INTRADAY_FRESHNESS_WINDOW: dict[MarketCapTier, int] = {
+    MarketCapTier.LARGE: 5,
+    MarketCapTier.MID:   15,
+    MarketCapTier.SMALL: 30,
+}
+
 # Static Nifty 50 membership (as of 2025)
 _NIFTY50: frozenset[str] = frozenset({
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR", "ITC",
@@ -172,20 +180,22 @@ def get_market_cap_tier(symbol: str) -> MarketCapTier:
     return MarketCapTier.SMALL
 
 
-def get_freshness_window(symbol: str) -> int:
+def get_freshness_window(symbol: str, intraday: bool = False) -> int:
     """Return the maximum event age in minutes that still carries edge.
 
-    Large caps (Nifty 50) get a 15-minute window — algos reprice within
-    seconds; retail still has a few minutes on less-watched names.
-    Mid-caps get 45 minutes.  Small-caps get 90 minutes.
+    Swing mode: Nifty50=15 min, mid=45 min, small=90 min.
+    Intraday mode: Nifty50=5 min, mid=15 min, small=30 min.
 
     Args:
         symbol: NSE stock symbol.
+        intraday: If True, return the tighter intraday window.
 
     Returns:
         Maximum event age in minutes.
     """
-    return FRESHNESS_WINDOW[get_market_cap_tier(symbol)]
+    tier = get_market_cap_tier(symbol)
+    windows = INTRADAY_FRESHNESS_WINDOW if intraday else FRESHNESS_WINDOW
+    return windows[tier]
 
 
 # ── Contextual direction scoring ──────────────────────────────────────────────
@@ -334,13 +344,23 @@ class CorporateEvent:
 
     @property
     def freshness_window(self) -> int:
-        """Maximum age in minutes for this event to still carry edge."""
-        return get_freshness_window(self.symbol)
+        """Maximum age in minutes for this event to still carry edge (swing mode)."""
+        return get_freshness_window(self.symbol, intraday=False)
+
+    @property
+    def intraday_freshness_window(self) -> int:
+        """Maximum age in minutes for this event to still carry edge (intraday mode)."""
+        return get_freshness_window(self.symbol, intraday=True)
 
     @property
     def is_fresh(self) -> bool:
-        """True if the event is within the tier-appropriate freshness window."""
+        """True if the event is within the tier-appropriate freshness window (swing)."""
         return self.age_minutes <= self.freshness_window
+
+    @property
+    def is_fresh_intraday(self) -> bool:
+        """True if the event is within the tighter intraday freshness window."""
+        return self.age_minutes <= self.intraday_freshness_window
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -354,7 +374,9 @@ class CorporateEvent:
             "direction_score": round(self.direction_score, 2),
             "urgency": self.urgency,
             "freshness_window_minutes": self.freshness_window,
+            "intraday_freshness_window_minutes": self.intraday_freshness_window,
             "is_fresh": self.is_fresh,
+            "is_fresh_intraday": self.is_fresh_intraday,
         }
 
 

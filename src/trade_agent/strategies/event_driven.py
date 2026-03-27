@@ -49,8 +49,10 @@ _ATR_STOP_MULTIPLIER = 1.5      # stop placed 1.5×ATR below entry
 _ATR_RR_RATIO = 2.5             # take-profit at 2.5× the risk distance (ATR)
 
 # Percentage-based fallback if ATR cannot be computed (< 15 rows of history)
-_SWING_STOP_LOSS_PCT = 0.03     # 3% stop fallback
-_SWING_TAKE_PROFIT_PCT = 0.09   # 9% target fallback (3:1 R:R minimum)
+_SWING_STOP_LOSS_PCT = 0.03     # 3% stop fallback (swing)
+_SWING_TAKE_PROFIT_PCT = 0.09   # 9% target fallback (swing)
+_INTRADAY_STOP_LOSS_PCT = 0.005  # 0.5% stop fallback (intraday, covers break-even)
+_INTRADAY_TAKE_PROFIT_PCT = 0.012  # 1.2% target fallback (intraday, 2.4:1 R:R)
 
 # Events that on their own are sufficient to trigger analysis
 _STANDALONE_TRIGGER_EVENTS = {
@@ -82,10 +84,15 @@ class EventDrivenStrategy(BaseStrategy):
         take_profit_pct: float = _SWING_TAKE_PROFIT_PCT,
         max_trade_amount: float = 10_000.0,
         require_technical_confirm: bool = True,
+        intraday_mode: bool = False,
     ) -> None:
+        if intraday_mode:
+            stop_loss_pct = _INTRADAY_STOP_LOSS_PCT
+            take_profit_pct = _INTRADAY_TAKE_PROFIT_PCT
         super().__init__(stop_loss_pct, take_profit_pct, max_trade_amount)
         self.min_conviction = min_conviction
         self.require_technical_confirm = require_technical_confirm
+        self.intraday_mode = intraday_mode
 
     def evaluate(
         self,
@@ -130,15 +137,20 @@ class EventDrivenStrategy(BaseStrategy):
                               "No material corporate events in window")
 
         # ── Gate 3: at least one actionable event ────────────────────────────
+        # Use intraday freshness window when in intraday mode (5/15/30 min vs 15/45/90 min)
         actionable = [
             e for e in evidence.events
-            if e.urgency >= _MIN_URGENCY and e.age_minutes <= 90
+            if e.urgency >= _MIN_URGENCY and (
+                e.is_fresh_intraday if self.intraday_mode else e.is_fresh
+            )
         ]
+        window_label = "intraday" if self.intraday_mode else "swing"
         if not actionable:
+            oldest_age = evidence.events[0].age_minutes if evidence.events else 0
             return self._skip(
                 symbol, entry_price, sl_raw, tp,
-                f"No high-urgency events within 90 min "
-                f"(oldest: {evidence.events[0].age_minutes:.0f}m)"
+                f"No high-urgency events within {window_label} freshness window "
+                f"(oldest event: {oldest_age:.0f}m ago)"
             )
 
         # ── Gate 4: conviction threshold ─────────────────────────────────────
